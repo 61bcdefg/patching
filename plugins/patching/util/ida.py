@@ -1,6 +1,8 @@
 import re
 import ctypes
 
+import lief
+
 import ida_ua
 import ida_ida
 import ida_idp
@@ -76,12 +78,34 @@ def is_range_patched(start_ea, end_ea=None):
 
     return bool(ida_bytes.visit_patched_bytes(start_ea, end_ea, visitor))
 
+applied_count = 0
+skipped_count = 0
+
 def apply_patches(filepath):
     """
     Apply the current IDB patches to the given filepath.
     """
 
     with open(filepath, 'r+b') as f:
+
+        file_format_name = ida_ida.getinf_str(ida_ida.INF_FILE_FORMAT_NAME)
+        bindings_addr = []
+        relocs_addr = []
+        if ida_ida.inf_is_64bit() and "Mach-O" in file_format_name:
+            parsed = lief.MachO.parse(filepath)
+            if isinstance(parsed, lief.MachO.FatBinary):
+                index = 0
+                if parsed.size > 1:
+                    index_str = file_format_name[:file_format_name.find(".")].replace("Fat Mach-O file, ", "")
+                    index = int(index_str) - 1
+                parsed = parsed.at(index)
+            if parsed.has_dyld_chained_fixups:
+                chained_fixups = parsed.dyld_chained_fixups
+                for binding in chained_fixups.bindings:
+                    bindings_addr.append(binding.address)
+            for seg in parsed.segments:
+                for reloc in seg.relocations:
+                    relocs_addr.append(reloc.address)
 
         #
         # a visitor function that will be called for each patched byte.
@@ -91,6 +115,17 @@ def apply_patches(filepath):
         #
 
         def visitor(ea, file_offset, original_value, patched_value):
+            global applied_count
+            global skipped_count
+
+            for binding_addr in bindings_addr:
+                if binding_addr <= ea <= binding_addr + 0x8:
+                    skipped_count += 1
+                    return 0
+            for reloc_addr in relocs_addr:
+                if reloc_addr <= ea <= reloc_addr + 0x8:
+                    skipped_count += 1
+                    return 0
 
             # the patched byte does not have a know file address
             if file_offset == ida_idaapi.BADADDR:
@@ -118,6 +153,8 @@ def apply_patches(filepath):
             # write the patched byte(s) to the output file
             f.write(patched_value)
 
+            applied_count += 1
+
             #
             # return 0 so that the visitor keeps going to the next patched bytes
             # instead of stopping after this one.
@@ -130,6 +167,11 @@ def apply_patches(filepath):
         #
 
         ida_bytes.visit_patched_bytes(0, ida_idaapi.BADADDR, visitor)
+
+        if skipped_count > 0:
+            print("Skipped %d patches because they are for analysis mach-o (Bindings or Relocations)\n" % skipped_count)
+        
+        print("Applied %d patches\n" % applied_count)
 
         #
         # all done, file will close as we leave this 'with' scoping
